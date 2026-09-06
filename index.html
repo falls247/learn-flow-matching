@@ -1,0 +1,662 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="NVIDIA Isaac GR00T N1.7のAction Headが画像・言語・Robot StateとGaussian NoiseからFlow MatchingでAction Chunkを生成する内部処理を、現行ソースコードに沿って学ぶ教材。">
+  <meta name="theme-color" content="#f6f7f5">
+  <title>GR00T N1.7 — Action Chunkはどう生成されるのか</title>
+  <link rel="stylesheet" href="./assets/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">本文へ移動</a>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#overview" aria-label="ページ先頭へ">
+        <span class="brand-mark" aria-hidden="true">G</span>
+        <span>GR00T N1.7 / Action Flow</span>
+      </a>
+      <div class="source-status">
+        <span class="status-dot" aria-hidden="true"></span>
+        Source of Truth: NVIDIA main @ <code>51d4c89</code>
+        <span class="status-date">調査 2026-09-06</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar" aria-label="目次">
+      <nav>
+        <p class="nav-kicker">LEARNING PATH</p>
+        <a href="#overview" class="nav-link active"><span>01</span>30秒で全体像</a>
+        <a href="#chunk" class="nav-link"><span>02</span>Action Chunk</a>
+        <a href="#horizon" class="nav-link"><span>03</span>Horizon</a>
+        <a href="#flow" class="nav-link"><span>04</span>Flow Matching</a>
+        <a href="#training" class="nav-link"><span>05</span>学習時</a>
+        <a href="#inference" class="nav-link"><span>06</span>推論時</a>
+        <a href="#dit" class="nav-link"><span>07</span>DiT</a>
+        <a href="#backbone" class="nav-link"><span>08</span>VLM / State</a>
+        <a href="#embodiment" class="nav-link"><span>09</span>Multi-Embodiment</a>
+        <a href="#rtc" class="nav-link"><span>10</span>RTC</a>
+        <a href="#end-to-end" class="nav-link"><span>11</span>End-to-End</a>
+        <a href="#industrial" class="nav-link"><span>12</span>産業ロボット例</a>
+        <a href="#misconceptions" class="nav-link"><span>13</span>誤解しやすい点</a>
+        <a href="#glossary" class="nav-link"><span>14</span>用語・Source</a>
+      </nav>
+    </aside>
+
+    <main id="main" class="content">
+      <section id="overview" class="section section-first">
+        <div class="eyebrow">01 · SYSTEM MAP</div>
+        <h1>GR00T N1.7は、<br><span>NoiseをAction trajectoryへ運ぶ</span></h1>
+        <p class="lead">画像と言語をVLMで意味特徴へ変換し、Robot StateとGaussian NoiseのAction tensorをAction Headへ入力。DiTが「完成Action」ではなく<strong>Action tensorを正解方向へ動かすvelocity</strong>を予測し、Euler積分でAction Chunkへ変換する。</p>
+
+        <div class="callout callout-strong">
+          <div class="callout-label">最初に覚える1文</div>
+          <p>Vision / Language + Robot State を条件として、<strong>[B, 40, 132] のGaussian Noise</strong>を4回のFlow Integrationで更新し、continuous Action Chunkを得る。40はモデルの最大horizonであり、全Embodimentが必ず40有効stepとは限らない。</p>
+        </div>
+
+        <div class="system-map" aria-label="GR00T N1.7 action generation overview">
+          <div class="map-inputs">
+            <div class="map-node input-node"><span class="node-icon">IMG</span><b>Camera Image</b><small>pixel_values</small></div>
+            <div class="map-node input-node"><span class="node-icon">TXT</span><b>Language</b><small>instruction</small></div>
+            <div class="map-node state-node"><span class="node-icon">S</span><b>Robot State</b><small>[B, 1, ≤132]</small></div>
+          </div>
+          <div class="map-arrow">↓</div>
+          <div class="map-backbone">
+            <div>
+              <span class="pill">VLM BACKBONE</span>
+              <h3>Cosmos-Reason2-2B</h3>
+              <p>Qwen3-VL architecture · hidden 2048</p>
+            </div>
+            <div class="feature-output">Vision / Language features<br><code>[B, seq, 2048]</code></div>
+          </div>
+          <div class="map-arrow split-arrow">↓ <span>+</span> ↓</div>
+          <div class="action-head-box">
+            <div class="action-head-title">
+              <span class="pill dark">ACTION HEAD</span>
+              <h3>Flow-Matching Action Head</h3>
+            </div>
+            <div class="head-grid">
+              <div class="head-node"><b>State Encoder</b><code>[B,1,1536]</code></div>
+              <div class="head-node noise"><b>Gaussian Noise</b><code>[B,40,132]</code></div>
+              <div class="head-node"><b>Action Encoder</b><code>[B,40,1536]</code></div>
+              <div class="head-node central"><b>AlternateVLDiT</b><small>16 layers</small><span>velocity field</span></div>
+              <div class="head-node"><b>Action Decoder</b><code>→ [B,40,132]</code></div>
+              <div class="head-node integrate"><b>Euler Integration</b><small>4 steps · Δt = 1/4</small></div>
+            </div>
+          </div>
+          <div class="map-arrow">↓</div>
+          <div class="map-output">
+            <span class="output-bracket">[</span>
+            <div><small>Action Chunk</small><b>a₀, a₁, a₂, …, a₃₉</b><code>[B, 40, 132]</code></div>
+            <span class="output-bracket">]</span>
+          </div>
+          <div class="map-arrow">↓</div>
+          <div class="execution-row">
+            <div><b>先頭 N stepを実行</b><small>Execution Horizon</small></div>
+            <span>→</span>
+            <div><b>新しい観測</b><small>image + state</small></div>
+            <span>→</span>
+            <div><b>再推論</b><small>Receding Horizon</small></div>
+          </div>
+        </div>
+
+        <div class="source-row">
+          <a class="source-chip" href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/gr00t/configs/model/gr00t_n1d7.py" target="_blank" rel="noreferrer">Source · gr00t_n1d7.py config</a>
+          <a class="source-chip" href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/gr00t/model/gr00t_n1d7/gr00t_n1d7.py" target="_blank" rel="noreferrer">Source · Gr00tN1d7ActionHead</a>
+        </div>
+      </section>
+
+      <section id="chunk" class="section">
+        <div class="eyebrow">02 · ACTION CHUNK</div>
+        <h2>Actionを1個ずつ文章のように生成しない</h2>
+        <p class="section-intro">Action Headが扱う単位は、未来の複数時刻をまとめたcontinuous tensor。N1.7 model configでは最大horizon 40。</p>
+
+        <div class="two-col">
+          <div class="panel">
+            <div class="panel-label">理解用：6軸arm + gripper</div>
+            <div class="matrix-demo">
+              <div class="matrix-header"><span>time</span><span>J1</span><span>J2</span><span>J3</span><span>J4</span><span>J5</span><span>J6</span><span>Grip</span></div>
+              <div class="matrix-row"><b>a₀</b><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+              <div class="matrix-row"><b>a₁</b><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+              <div class="matrix-row"><b>a₂</b><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+              <div class="matrix-ellipsis">⋮</div>
+              <div class="matrix-row"><b>a₃₉</b><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            </div>
+            <p class="note">この7次元は概念例。N1.7全Embodiment共通仕様ではない。</p>
+          </div>
+
+          <div class="panel important-panel">
+            <div class="panel-label">現行N1.7 tensor contract</div>
+            <div class="tensor-card">
+              <div class="tensor-name">Action tensor</div>
+              <div class="tensor-shape">[ B, H, D ]</div>
+              <dl>
+                <div><dt>B</dt><dd>batch</dd></div>
+                <div><dt>H</dt><dd>model max = <strong>40</strong></dd></div>
+                <div><dt>D</dt><dd>model max = <strong>132</strong></dd></div>
+              </dl>
+            </div>
+            <p>ProcessorはEmbodiment固有Actionを最後の次元と時間方向の両方でpadding。実データ部分だけ <code>action_mask=1</code>、padding領域は0。</p>
+          </div>
+        </div>
+
+        <div class="precision-box">
+          <span class="precision-title">重要な精度補足</span>
+          <p><code>action_horizon = 40</code> は<strong>Action Headが扱う最大tensor horizon</strong>。各Embodimentの有効horizonは <code>ModalityConfig.action.delta_indices</code> の長さで決まり、40未満でもよい。例えば公式の新規Embodiment例には16-step構成が存在する。よって「N1.7は常に40個すべてを意味のあるActionとして出す」と固定的に説明しない。</p>
+        </div>
+
+        <details class="code-details">
+          <summary>コード対応を見る</summary>
+          <pre><code># gr00t/configs/model/gr00t_n1d7.py
+max_action_dim = 132
+action_horizon = 40
+
+# processing_gr00t_n1d7.py
+# 1) real action dim → max_action_dim までzero padding
+# 2) real action horizon → max_action_horizon までzero padding
+# 3) action_maskで有効な時間×次元だけloss対象にする</code></pre>
+        </details>
+      </section>
+
+      <section id="horizon" class="section">
+        <div class="eyebrow">03 · HORIZONS</div>
+        <h2>PredictionとExecutionを分けて考える</h2>
+        <p class="section-intro"><strong>Action Horizon</strong>はモデルが予測する未来範囲。<strong>Execution Horizon</strong>は、その予測のうち次の再推論まで何step実行するか。後者はAction Headの固定値ではない。</p>
+
+        <div class="horizon-visual">
+          <div class="timeline-title"><span>Policy inference</span><b>Action Horizon = 40</b></div>
+          <div class="action-cells" id="actionCells" aria-label="40 action steps"></div>
+          <div class="legend"><span class="legend-execute">■ 実行</span><span class="legend-discard">■ 今回は実行しない</span></div>
+          <div class="horizon-control">
+            <label for="executionHorizon">Execution Horizon <output id="executionValue">8</output> step</label>
+            <input id="executionHorizon" type="range" min="1" max="40" value="8">
+            <div class="horizon-result">
+              <span><b id="executeCount">8</b> step 実行</span>
+              <span>→</span>
+              <span><b id="discardCount">32</b> step 未実行</span>
+              <span>→</span>
+              <span>新観測 → 再推論</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="four-facts">
+          <div><small>MODEL</small><b>Action Horizon</b><p>一度の生成で持つ未来step数。N1.7 config最大40。</p></div>
+          <div><small>DEPLOYMENT</small><b>Execution Horizon</b><p>次の推論まで何step使うか。例: standalone scriptの8。</p></div>
+          <div><small>ROBOT</small><b>Control Frequency</b><p>Action commandをrobotへ送る周期。例: 30 FPS。</p></div>
+          <div><small>POLICY</small><b>Inference Frequency</b><p>新しいchunkを生成する周期。Control Frequencyと同一でなくてよい。</p></div>
+        </div>
+
+        <div class="callout warning">
+          <div class="callout-label">混同禁止</div>
+          <p><strong>Flow integration 4 step</strong> と <strong>robot action 40 timestep</strong> と <strong>execution horizon N</strong> は、それぞれ別の時間軸。</p>
+        </div>
+        <div class="source-row">
+          <a class="source-chip" href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/scripts/deployment/standalone_inference_script.py" target="_blank" rel="noreferrer">Source · --execution-horizon 8 example</a>
+          <a class="source-chip" href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/getting_started/real_world_deployment.md" target="_blank" rel="noreferrer">Source · Receding Horizon / 30 FPS</a>
+        </div>
+      </section>
+
+      <section id="flow" class="section">
+        <div class="eyebrow">04 · FLOW MATCHING</div>
+        <h2>画像ではなく、Action tensorを「流す」</h2>
+        <p class="section-intro">Flow Matchingを「ぼやけた画像を綺麗にする」と捉えるとN1.7を誤解する。ここで変形される対象は<strong>未来40-stepのAction trajectory tensor</strong>。</p>
+
+        <div class="flow-simulator">
+          <div class="sim-header">
+            <div>
+              <span class="panel-label">CONCEPT SIMULATION</span>
+              <h3>Noise → Action trajectory</h3>
+            </div>
+            <div class="sim-time"><span>flow time</span><b id="flowTime">t = 0.00</b></div>
+          </div>
+          <svg id="flowChart" viewBox="0 0 800 280" role="img" aria-label="NoiseからAction trajectoryへ変化する概念図">
+            <line x1="50" y1="140" x2="760" y2="140" class="axis-line"></line>
+            <polyline id="noiseLine" points="" class="noise-line"></polyline>
+            <polyline id="targetLine" points="" class="target-line"></polyline>
+            <polyline id="currentLine" points="" class="current-line"></polyline>
+          </svg>
+          <div class="sim-legend"><span><i class="dot noise-dot"></i>Noise ε</span><span><i class="dot target-dot"></i>GT-like trajectory A</span><span><i class="dot current-dot"></i>x<sub>t</sub></span></div>
+          <label class="flow-slider-label" for="flowSlider"><span>Noise</span><input id="flowSlider" type="range" min="0" max="100" value="0"><span>Action</span></label>
+          <p class="sim-note">概念説明用simulation。実際のGR00T推論をブラウザで再現しているわけではない。学習で使う直線補間 <code>xₜ=(1−t)ε+tA</code> の直感を可視化。</p>
+        </div>
+
+        <div class="equation-strip">
+          <div><small>START</small><strong>ε ~ N(0, I)</strong><span>Gaussian Noise</span></div>
+          <div class="eq-arrow">→</div>
+          <div><small>PATH</small><strong>xₜ=(1−t)ε+tA</strong><span>interpolation</span></div>
+          <div class="eq-arrow">→</div>
+          <div><small>DIRECTION</small><strong>v=A−ε</strong><span>target velocity</span></div>
+        </div>
+      </section>
+
+      <section id="training" class="section">
+        <div class="eyebrow">05 · TRAINING</div>
+        <h2>教師は「Actionそのもの」ではなく、Noise→Action方向</h2>
+
+        <div class="training-diagram">
+          <div class="train-input gt"><span>Ground Truth</span><b>Action A</b><code>[B,H,D]</code></div>
+          <div class="train-input noise-box"><span>Random</span><b>Noise ε</b><code>N(0,I)</code></div>
+          <div class="merge-lines"><span>↘</span><span>↙</span></div>
+          <div class="train-stage"><small>sample t</small><b>xₜ = (1−t)ε + tA</b><span>途中のnoisy trajectoryを作る</span></div>
+          <div class="down-arrow">↓</div>
+          <div class="conditioning-row">
+            <div>Vision / Language<br><code>[B,seq,2048]</code></div>
+            <div>State<br><code>[B,1,132] → [B,1,1536]</code></div>
+            <div>Noisy Action xₜ<br><code>[B,40,132] → [B,40,1536]</code></div>
+          </div>
+          <div class="down-arrow">↓</div>
+          <div class="train-model"><span>AlternateVLDiT + Action Decoder</span><b>predicted velocity vθ</b><code>[B,40,132]</code></div>
+          <div class="down-arrow">↓</div>
+          <div class="loss-box"><b>Masked MSE</b><span>vθ と (A − ε) を比較</span><code>loss = Σ MSE(pred, velocity) × action_mask / Σ mask</code></div>
+        </div>
+
+        <div class="key-insight">
+          <span>KEY INSIGHT</span>
+          <p>モデルが学ぶのは「この途中状態 <code>xₜ</code> なら、Action tensorをどちらへどれだけ動かすべきか」という<strong>velocity field</strong>。完成Actionを1回で直接回帰する構造ではない。</p>
+        </div>
+
+        <details class="code-details" open>
+          <summary>現行コードの核心</summary>
+          <pre><code>actions = action_input.action
+noise = torch.randn(actions.shape)
+t = sample_time(...)
+
+noisy_trajectory = (1 - t) * noise + t * actions
+velocity = actions - noise
+
+action_features = action_encoder(noisy_trajectory, t_discretized, embodiment_id)
+...
+pred = action_decoder(model_output, embodiment_id)
+pred_actions = pred[:, -actions.shape[1]:]
+
+action_loss = mse_loss(pred_actions, velocity, reduction="none") * action_mask</code></pre>
+        </details>
+        <div class="source-row"><a class="source-chip" href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/gr00t/model/gr00t_n1d7/gr00t_n1d7.py" target="_blank" rel="noreferrer">Source · Gr00tN1d7ActionHead.forward()</a></div>
+      </section>
+
+      <section id="inference" class="section">
+        <div class="eyebrow">06 · INFERENCE</div>
+        <h2>推論ではGTなし。Noiseから4回、自分で進む</h2>
+        <p class="section-intro">推論開始時の <code>actions</code> は乱数。各integration stepでAction Encoder → DiT → Decoderを通してvelocityを得て、Euler updateする。</p>
+
+        <div class="compare-grid">
+          <div class="compare-card">
+            <span class="compare-tag">TRAINING</span>
+            <ol class="process-list">
+              <li><b>GT Actionあり</b><span>A</span></li>
+              <li><b>Noise生成</b><span>ε</span></li>
+              <li><b>途中状態を作る</b><span>xₜ</span></li>
+              <li><b>正解velocityを作る</b><span>A−ε</span></li>
+              <li><b>velocity predictionを学習</b><span>MSE</span></li>
+            </ol>
+          </div>
+          <div class="compare-card accent-card">
+            <span class="compare-tag">INFERENCE</span>
+            <ol class="process-list">
+              <li><b>GT Actionなし</b><span>—</span></li>
+              <li><b>Noiseから開始</b><span>[B,40,132]</span></li>
+              <li><b>DiT → velocity</b><span>t=0/4</span></li>
+              <li><b>Euler update</b><span>A ← A + ¼v</span></li>
+              <li><b>4回繰り返す</b><span>t=0, .25, .5, .75</span></li>
+            </ol>
+          </div>
+        </div>
+
+        <div class="integration-steps">
+          <div class="integration-label">Flow integration</div>
+          <div class="integration-step"><span>0</span><b>Noise</b><small>t=0.00</small></div>
+          <div class="integration-arrow">→</div>
+          <div class="integration-step"><span>1</span><b>update</b><small>+¼v₀</small></div>
+          <div class="integration-arrow">→</div>
+          <div class="integration-step"><span>2</span><b>update</b><small>+¼v₁</small></div>
+          <div class="integration-arrow">→</div>
+          <div class="integration-step"><span>3</span><b>update</b><small>+¼v₂</small></div>
+          <div class="integration-arrow">→</div>
+          <div class="integration-step"><span>4</span><b>Action</b><small>+¼v₃</small></div>
+        </div>
+
+        <div class="callout callout-strong">
+          <div class="callout-label">4 stepの正体</div>
+          <p><code>num_inference_timesteps = 4</code> は<strong>Action tensorを数値的に更新する回数</strong>。robotが4回動く意味ではない。robot時間軸はAction Chunkの40 timestep側。</p>
+        </div>
+
+        <details class="code-details">
+          <summary>Euler integration実装</summary>
+          <pre><code>actions = torch.randn(
+    size=(batch_size, action_horizon, action_dim)
+)
+
+dt = 1.0 / num_inference_timesteps  # 1/4
+
+for t in range(num_inference_timesteps):
+    t_cont = t / num_inference_timesteps
+    ...
+    pred_velocity = pred[:, -action_horizon:]
+    actions = actions + dt * pred_velocity * vel_strength</code></pre>
+        </details>
+      </section>
+
+      <section id="dit" class="section">
+        <div class="eyebrow">07 · WHAT DiT DOES</div>
+        <h2>DiTは「Action generator」より「velocity-field estimator」</h2>
+
+        <div class="dit-io">
+          <div class="dit-input-stack">
+            <div><span>CONDITION</span><b>Vision / Language</b><code>[B,seq,2048]</code></div>
+            <div><span>TOKEN</span><b>State features</b><code>[B,1,1536]</code></div>
+            <div><span>TOKEN</span><b>Noisy Action features</b><code>[B,40,1536]</code></div>
+            <div><span>TIME</span><b>Flow timestep</b><code>0…999 bucket</code></div>
+            <div><span>ROBOT</span><b>Embodiment ID</b><code>[B]</code></div>
+          </div>
+          <div class="dit-arrow">→</div>
+          <div class="dit-core">
+            <small>AlternateVLDiT</small>
+            <b>16 layers</b>
+            <span>State + Action sequence<br>conditioned by V/L</span>
+          </div>
+          <div class="dit-arrow">→</div>
+          <div class="dit-output">
+            <small>Action Decoder</small>
+            <b>pred velocity</b>
+            <code>[B,40,132]</code>
+          </div>
+        </div>
+
+        <div class="shape-walk">
+          <h3>1回のintegrationでshapeを追う</h3>
+          <div class="shape-flow">
+            <div><small>raw action</small><code>[B,40,132]</code></div><span>→</span>
+            <div><small>Action Encoder</small><code>[B,40,1536]</code></div><span>+</span>
+            <div><small>State Encoder</small><code>[B,1,1536]</code></div><span>→</span>
+            <div><small>concat</small><code>[B,41,1536]</code></div><span>→</span>
+            <div><small>DiT / Decoder</small><code>[B,40,132]</code></div>
+          </div>
+        </div>
+
+        <div class="note-box"><b>位置埋め込み</b><p>Action Encoder後、40個のAction tokenそれぞれへlearned position embeddingを加える。Flow timestep自体はAction Encoder内でもsinusoidal encodingとして注入され、DiTにもtimestepとして渡る。</p></div>
+        <div class="source-row">
+          <a class="source-chip" href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/gr00t/model/modules/embodiment_conditioned_mlp.py" target="_blank" rel="noreferrer">Source · MultiEmbodimentActionEncoder</a>
+          <a class="source-chip" href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/gr00t/configs/model/gr00t_n1d7.py" target="_blank" rel="noreferrer">Source · diffusion_model_cfg</a>
+        </div>
+      </section>
+
+      <section id="backbone" class="section">
+        <div class="eyebrow">08 · VLM BACKBONE + ROBOT STATE</div>
+        <h2>「何をすべきか」と「今どこにいるか」を別経路で条件化</h2>
+
+        <div class="role-split">
+          <div class="role-card vlm-role">
+            <span class="role-number">A</span>
+            <small>Cosmos-Reason2-2B / Qwen3-VL</small>
+            <h3>Scene + Instruction</h3>
+            <p>画像tokenと言語tokenを処理し、Action Headが参照するsemantic feature列を作る。</p>
+            <div class="role-question">「何が見えていて、何をする指示か」</div>
+          </div>
+          <div class="role-card state-role">
+            <span class="role-number">B</span>
+            <small>CategorySpecificMLP</small>
+            <h3>Robot State</h3>
+            <p>正規化・padding済みStateをEmbodiment固有weightで1536次元featureへ変換。</p>
+            <div class="role-question">「今のrobot configurationは何か」</div>
+          </div>
+          <div class="role-card head-role">
+            <span class="role-number">C</span>
+            <small>Flow-Matching Action Head</small>
+            <h3>Continuous Motion</h3>
+            <p>V/LとStateを条件としてNoise Action上のvelocity fieldを予測。</p>
+            <div class="role-question">「この状況からどう動くか」</div>
+          </div>
+        </div>
+
+        <div class="state-pipeline">
+          <div>Robot State<br><small>joint / gripper / EEF etc.</small></div><span>→</span>
+          <div>Normalize<br><small>statistics依存</small></div><span>→</span>
+          <div>Concat + Pad<br><small>max 132 dim</small></div><span>→</span>
+          <div>State Encoder<br><small>Embodiment-conditioned</small></div><span>→</span>
+          <div>State Feature<br><small>[B,1,1536]</small></div>
+        </div>
+        <p class="note">Stateの中身はEmbodiment / Modality Config依存。「必ずjoint positions + EEF pose」という固定仕様ではない。現行configの <code>state_history_length=1</code>。</p>
+
+        <div class="myth-correction"><span>×</span><p>「VLMが文章tokenとしてjoint angleをautoregressive生成する」</p><strong>→ VLM featureを条件に、別のcontinuous Action HeadがAction tensorを生成。</strong></div>
+      </section>
+
+      <section id="embodiment" class="section">
+        <div class="eyebrow">09 · MULTI-EMBODIMENT</div>
+        <h2>違うロボットを、同じtensor envelopeへ入れる</h2>
+        <p class="section-intro">Humanoid、single arm、bimanualなどでState / Action次元や意味は異なる。N1.7は「全ロボットを同じ7DoFへ変換」するのではなく、padding・mask・Embodiment-conditioned projectorを組み合わせる。</p>
+
+        <div class="embodiment-diagram">
+          <div class="robot-examples">
+            <div><span>ARM A</span><code>D=7, H=16</code></div>
+            <div><span>DROID-like</span><code>EEF + grip + joint</code></div>
+            <div><span>HUMANOID</span><code>larger D</code></div>
+          </div>
+          <div class="down-arrow">↓ normalize / concat / pad</div>
+          <div class="padded-tensor">
+            <div class="tensor-axis">H ≤ 40</div>
+            <div class="tensor-grid-mini" aria-hidden="true"></div>
+            <div class="tensor-axis bottom">D ≤ 132</div>
+            <span class="valid-zone">valid</span>
+            <span class="pad-zone">padding</span>
+          </div>
+          <div class="down-arrow">↓ action_mask + embodiment_id</div>
+          <div class="projector-row">
+            <div><b>CategorySpecificMLP</b><small>State Encoder</small></div>
+            <div><b>MultiEmbodimentActionEncoder</b><small>Action + timestep</small></div>
+            <div><b>CategorySpecificMLP</b><small>Action Decoder</small></div>
+          </div>
+        </div>
+
+        <div class="fact-table-wrap">
+          <table class="fact-table">
+            <thead><tr><th>仕組み</th><th>現行値 / 役割</th><th>どこに効くか</th></tr></thead>
+            <tbody>
+              <tr><td><code>max_state_dim</code></td><td>132</td><td>Stateを共通幅へpadding</td></tr>
+              <tr><td><code>max_action_dim</code></td><td>132</td><td>Actionを共通幅へpadding</td></tr>
+              <tr><td><code>action_horizon</code></td><td>40</td><td>Action Headの最大時間長</td></tr>
+              <tr><td><code>action_mask</code></td><td>0 / 1 tensor</td><td>padding dimension / horizonをlossから除外</td></tr>
+              <tr><td><code>embodiment_id</code></td><td>projector index</td><td>Embodiment別weightを選択</td></tr>
+              <tr><td><code>max_num_embodiments</code></td><td>32</td><td>category-specific projectorのslot数</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="action-representation">
+          <h3>Action表現は何か？</h3>
+          <div class="representation-options">
+            <span>joint</span><span>EEF</span><span>gripper</span><span>absolute</span><span>relative</span>
+          </div>
+          <p><strong>答え：Embodiment / Modality Config依存。</strong>現行repositoryにはjoint-space例、EEF系、relative action系が共存。ProcessorがModality keysを連結・正規化し、decode時に有効horizon / dimensionへ戻してunnormalizeする。</p>
+        </div>
+        <div class="source-row">
+          <a class="source-chip" href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/gr00t/model/gr00t_n1d7/processing_gr00t_n1d7.py" target="_blank" rel="noreferrer">Source · padding / action_mask / decode_action</a>
+          <a class="source-chip" href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/gr00t/configs/data/embodiment_configs.py" target="_blank" rel="noreferrer">Source · Modality Config</a>
+        </div>
+      </section>
+
+      <section id="rtc" class="section advanced-section">
+        <div class="eyebrow">10 · ADVANCED / RTC</div>
+        <h2>RTCは「毎回まっさらなNoise」ではなく、前chunkを拘束条件に使う</h2>
+        <div class="experimental-badge">EXPERIMENTAL IN CURRENT REPOSITORY</div>
+        <p class="section-intro">現行N1.7 Action HeadにはRTC用low-level primitiveが存在。ただし公式deployment guideでは、<strong>Gr00tPolicy / server-client pathへ未配線、testやready-made exampleなし</strong>と明記。</p>
+
+        <div class="rtc-compare">
+          <div class="rtc-card">
+            <span>NORMAL</span>
+            <div class="chunk-strip"><i class="new"></i><i class="new"></i><i class="new"></i><i class="new"></i><i class="new"></i><i class="new"></i><i class="new"></i><i class="new"></i></div>
+            <b>Pure noiseからnew chunk</b>
+            <small>各推論を独立に開始</small>
+          </div>
+          <div class="rtc-arrow">→</div>
+          <div class="rtc-card rtc-active">
+            <span>RTC</span>
+            <div class="chunk-strip"><i class="frozen"></i><i class="frozen"></i><i class="ramp"></i><i class="ramp"></i><i class="new"></i><i class="new"></i><i class="new"></i><i class="new"></i></div>
+            <b>previous tail + new noise</b>
+            <small>overlapをinpainting-likeに拘束</small>
+          </div>
+        </div>
+
+        <div class="rtc-params">
+          <div><code>rtc_overlap_steps</code><p>前chunk末尾から、新chunk先頭へコピーするstep数。</p></div>
+          <div><code>rtc_frozen_steps</code><p>velocity strength=0。以前のActionを完全固定する範囲。</p></div>
+          <div><code>rtc_ramp_rate</code><p>frozen後〜overlap終端でvelocity更新強度を0→1へ滑らかに増やす。</p></div>
+        </div>
+
+        <div class="rtc-code-flow">
+          <div><b>1</b><span>新chunk全体をNoise初期化</span></div>
+          <div><b>2</b><span>先頭overlapへprevious action tailをコピー</span></div>
+          <div><b>3</b><span>frozen領域の <code>vel_strength=0</code></span></div>
+          <div><b>4</b><span>中間領域へexponential ramp</span></div>
+          <div><b>5</b><span>通常と同じ4回Flow Integration</span></div>
+        </div>
+
+        <div class="why-rtc">
+          <h3>なぜ必要か</h3>
+          <div><b>Inference latency</b><p>次chunk推論中も既存chunkを実行しやすくする。</p></div>
+          <div><b>Boundary continuity</b><p>隣接chunkの境界で急にtrajectoryが切り替わる問題を抑える。</p></div>
+          <div><b>Real-time scheduling</b><p>Asynchronous inferenceと組み合わせ、stop-and-goを避ける狙い。</p></div>
+        </div>
+        <div class="source-row">
+          <a class="source-chip" href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/gr00t/model/gr00t_n1d7/gr00t_n1d7.py" target="_blank" rel="noreferrer">Source · RTC in get_action_with_features()</a>
+          <a class="source-chip" href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/getting_started/real_world_deployment.md" target="_blank" rel="noreferrer">Source · RTC status / deployment guidance</a>
+        </div>
+      </section>
+
+      <section id="end-to-end" class="section">
+        <div class="eyebrow">11 · END-TO-END TRACE</div>
+        <h2>Action tensorの一生を、入口から出口まで追う</h2>
+
+        <div class="e2e-list">
+          <div class="e2e-item"><span>01</span><div><b>Camera + Language</b><small>Qwen3-VL processorでimage / text input化</small></div><code>pixel + token</code></div>
+          <div class="e2e-item"><span>02</span><div><b>Cosmos-Reason2-2B</b><small>Vision / Language hidden features</small></div><code>[B,seq,2048]</code></div>
+          <div class="e2e-item"><span>03</span><div><b>Robot State preprocessing</b><small>normalize → concat → max_state_dimへpad</small></div><code>[B,1,132]</code></div>
+          <div class="e2e-item"><span>04</span><div><b>State Encoder</b><small>embodiment-specific MLP</small></div><code>[B,1,1536]</code></div>
+          <div class="e2e-item emphasis"><span>05</span><div><b>Gaussian Action Noise</b><small>未来trajectory全体を乱数で初期化</small></div><code>[B,40,132]</code></div>
+          <div class="e2e-item"><span>06</span><div><b>Action Encoder</b><small>action + flow timestep + embodiment</small></div><code>[B,40,1536]</code></div>
+          <div class="e2e-item"><span>07</span><div><b>State + Action concat</b><small>DiTへ入るSA token列</small></div><code>[B,41,1536]</code></div>
+          <div class="e2e-item"><span>08</span><div><b>AlternateVLDiT</b><small>V/L featuresをconditionとしてSAを更新</small></div><code>16 layers</code></div>
+          <div class="e2e-item"><span>09</span><div><b>Action Decoder</b><small>最後の40 tokenからvelocityへ投影</small></div><code>[B,40,132]</code></div>
+          <div class="e2e-item emphasis"><span>10</span><div><b>Euler update × 4</b><small>actions ← actions + ¼·velocity</small></div><code>Flow integrate</code></div>
+          <div class="e2e-item"><span>11</span><div><b>Normalized Action Chunk</b><small>processor decode / unnormalize</small></div><code>[Hvalid,Dvalid]</code></div>
+          <div class="e2e-item"><span>12</span><div><b>Execute first N</b><small>Execution Horizonはdeployment側で決定</small></div><code>N ≤ Hvalid</code></div>
+          <div class="e2e-item"><span>13</span><div><b>New observation</b><small>再びCamera / Stateを取得</small></div><code>next inference</code></div>
+        </div>
+
+        <div class="final-model">
+          <span>MENTAL MODEL</span>
+          <p>GR00T N1.7 = <strong>VLMが環境意味を表現</strong>し、<strong>Stateが現在のrobot configurationを与え</strong>、<strong>Action HeadがNoise trajectory上のvelocity fieldを予測</strong>して、複数回積分でcontinuous Action Chunkを得るpolicy。</p>
+        </div>
+      </section>
+
+      <section id="industrial" class="section">
+        <div class="eyebrow">12 · 6DoF INDUSTRIAL ROBOT EXAMPLE</div>
+        <h2>「もし6DoF産業ロボットだったら」</h2>
+        <p class="section-intro">ここは理解用の置き換え例。GR00T N1.7が特定FANUC機へそのまま接続できる、という意味ではない。</p>
+
+        <div class="industrial-flow">
+          <div class="industrial-inputs">
+            <div><b>Camera</b><small>part / gripper / workspace</small></div>
+            <div><b>“Pick the part”</b><small>language instruction</small></div>
+            <div><b>Current robot state</b><small>e.g. J1…J6 + gripper</small></div>
+          </div>
+          <div class="down-arrow">↓</div>
+          <div class="industrial-model">GR00T N1.7<br><small>VLM + Flow-Matching Action Head</small></div>
+          <div class="down-arrow">↓</div>
+          <div class="industrial-chunk">
+            <div><span>t0</span><code>[J1,J2,J3,J4,J5,J6,gripper]</code></div>
+            <div><span>t1</span><code>[ … ]</code></div>
+            <div><span>t2</span><code>[ … ]</code></div>
+            <div><span>⋮</span><code>conceptual example</code></div>
+          </div>
+        </div>
+
+        <div class="boundary-stack">
+          <h3>VLAの役割とrobot stackの役割を混ぜない</h3>
+          <div class="boundary-row"><span class="layer vla">VLA</span><p>「タスク文脈から、どんなmotion trajectoryが望ましいか」を予測</p></div>
+          <div class="boundary-row"><span class="layer planning">Planning / Conversion</span><p>必要に応じてIK、trajectory conversion、collision-aware planningなど</p></div>
+          <div class="boundary-row"><span class="layer ros">ROS 2 / Driver</span><p>robot interfaceへcommandを橋渡し</p></div>
+          <div class="boundary-row"><span class="layer controller">Robot Controller</span><p>servo / interpolation / hardware execution</p></div>
+          <div class="boundary-row"><span class="layer safety">Safety</span><p>速度・力・workspace・interlock等。VLAの推論とは別系統で担保</p></div>
+        </div>
+      </section>
+
+      <section id="misconceptions" class="section">
+        <div class="eyebrow">13 · COMMON MISCONCEPTIONS</div>
+        <h2>ここを間違えると全体像が崩れる</h2>
+
+        <div class="myth-list">
+          <article><span>01</span><div><h3>Actionを1stepずつautoregressive生成？</h3><p><b>違う。</b> Action Headでは未来chunk全体をcontinuous tensorとして同時に扱う。</p></div></article>
+          <article><span>02</span><div><h3>DiTはGaussian Noise εを予測？</h3><p><b>現行N1.7では違う。</b> training targetは <code>velocity = actions − noise</code>。</p></div></article>
+          <article><span>03</span><div><h3>Action Horizon 40なら40step全部実行？</h3><p><b>違う。</b> Execution Horizonはdeployment側の別概念。さらにEmbodiment有効horizon自体が40未満の場合もある。</p></div></article>
+          <article><span>04</span><div><h3>VLMがjoint angleをtoken生成？</h3><p><b>違う。</b> VLMはsemantic features。continuous ActionはAction Head側。</p></div></article>
+          <article><span>05</span><div><h3>全Robot共通で7DoF Action？</h3><p><b>違う。</b> Action keys / dimension / relative・absoluteはEmbodiment Config依存。</p></div></article>
+          <article><span>06</span><div><h3>Flow Matchingの4 step = robotが4回動く？</h3><p><b>完全に別。</b> 4は数値積分回数、40はActionの時間軸。</p></div></article>
+        </div>
+
+        <div class="diffusion-flow-box">
+          <h3>「DiffusionなのかFlow Matchingなのか」</h3>
+          <p>コードdocstringには <code>flow matching diffusion policy</code>、コメントには <code>denoising steps</code> が登場。一方、実際のtraining targetはvelocity <code>A−ε</code>、推論はvelocityをEuler integrationする実装。したがって教材では、<strong>Flow Matchingで実装されたcontinuous-action generative policy</strong>を主語にしつつ、repository内でdiffusion / denoisingという語が併用される事実も残す。</p>
+        </div>
+      </section>
+
+      <section id="glossary" class="section">
+        <div class="eyebrow">14 · GLOSSARY + SOURCES</div>
+        <h2>重要用語と検証元</h2>
+
+        <div class="glossary-grid">
+          <div><b>VLA</b><p>Vision-Language-Action。視覚・言語をrobot actionへ接続するpolicy。</p></div>
+          <div><b>Action Chunk</b><p>未来複数stepのActionをまとめたsequence tensor。</p></div>
+          <div><b>Action Horizon</b><p>一度に予測する未来範囲。N1.7 model最大40。</p></div>
+          <div><b>Execution Horizon</b><p>予測chunkから次推論まで実行するstep数。</p></div>
+          <div><b>Flow Matching</b><p>Noise分布からdata分布へ運ぶvelocity fieldを学習する生成法。</p></div>
+          <div><b>Gaussian Noise</b><p>推論のAction tensor初期値。標準正規乱数。</p></div>
+          <div><b>Velocity Field</b><p>現在のnoisy Actionをどちらへ動かすか示すベクトル場。</p></div>
+          <div><b>DiT</b><p>Diffusion Transformer系block。N1.7ではvelocity予測表現を処理。</p></div>
+          <div><b>Euler Integration</b><p><code>x ← x + Δt·v</code> の数値積分。現行configは4 step。</p></div>
+          <div><b>Timestep</b><p>Flow上の進行度。Action EncoderとDiTへ条件として入力。</p></div>
+          <div><b>Padding / Mask</b><p>異なるdimension / horizonを共通tensorへ詰め、無効領域をmask。</p></div>
+          <div><b>Embodiment</b><p>robot身体構造・action/state定義の単位。</p></div>
+          <div><b>Receding Horizon</b><p>chunk先頭だけ実行し、最新観測から再計画する運用。</p></div>
+          <div><b>RTC</b><p>前chunk overlapを新chunk生成へ取り込むReal-Time Chunking。</p></div>
+        </div>
+
+        <div class="source-section">
+          <h3>Primary sources</h3>
+          <p class="source-note">調査日 2026-09-06。下記は調査時点のNVIDIA/Isaac-GR00T <code>main</code> commit <code>51d4c89f72fda44cbf77285c6a8114b52676b8a1</code> へ固定。</p>
+          <div class="source-list">
+            <a href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/gr00t/configs/model/gr00t_n1d7.py" target="_blank" rel="noreferrer"><span>01</span><div><b>Model Config</b><code>gr00t/configs/model/gr00t_n1d7.py</code></div></a>
+            <a href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/gr00t/model/gr00t_n1d7/gr00t_n1d7.py" target="_blank" rel="noreferrer"><span>02</span><div><b>Action Head / forward / get_action</b><code>gr00t/model/gr00t_n1d7/gr00t_n1d7.py</code></div></a>
+            <a href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/gr00t/model/gr00t_n1d7/processing_gr00t_n1d7.py" target="_blank" rel="noreferrer"><span>03</span><div><b>Normalization / padding / masks</b><code>processing_gr00t_n1d7.py</code></div></a>
+            <a href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/gr00t/model/modules/embodiment_conditioned_mlp.py" target="_blank" rel="noreferrer"><span>04</span><div><b>Embodiment-conditioned encoders</b><code>embodiment_conditioned_mlp.py</code></div></a>
+            <a href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/gr00t/model/modules/qwen3_backbone.py" target="_blank" rel="noreferrer"><span>05</span><div><b>Qwen3-VL backbone</b><code>qwen3_backbone.py</code></div></a>
+            <a href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/gr00t/configs/data/embodiment_configs.py" target="_blank" rel="noreferrer"><span>06</span><div><b>Embodiment / Modality Config</b><code>embodiment_configs.py</code></div></a>
+            <a href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/gr00t/data/state_action/action_chunking.py" target="_blank" rel="noreferrer"><span>07</span><div><b>Action Chunk utilities</b><code>action_chunking.py</code></div></a>
+            <a href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/scripts/deployment/standalone_inference_script.py" target="_blank" rel="noreferrer"><span>08</span><div><b>Execution Horizon example</b><code>standalone_inference_script.py</code></div></a>
+            <a href="https://github.com/NVIDIA/Isaac-GR00T/blob/51d4c89f72fda44cbf77285c6a8114b52676b8a1/getting_started/real_world_deployment.md" target="_blank" rel="noreferrer"><span>09</span><div><b>RTC / asynchronous deployment guidance</b><code>real_world_deployment.md</code></div></a>
+          </div>
+        </div>
+
+        <div class="verification-grid">
+          <div><span>✓</span>VLM Backbone<br><b>Cosmos-Reason2-2B</b></div>
+          <div><span>✓</span>Action Horizon<br><b>40 max</b></div>
+          <div><span>✓</span>Action / State Dim<br><b>132 max</b></div>
+          <div><span>✓</span>Flow Steps<br><b>4</b></div>
+          <div><span>✓</span>DiT Layers<br><b>16</b></div>
+          <div><span>✓</span>Training Target<br><b>A − ε</b></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <footer class="footer">
+    <div><b>GR00T N1.7 Action Flow</b><span>Source-code-first learning material</span></div>
+    <a href="https://github.com/NVIDIA/Isaac-GR00T/tree/51d4c89f72fda44cbf77285c6a8114b52676b8a1" target="_blank" rel="noreferrer">NVIDIA/Isaac-GR00T @ 51d4c89 ↗</a>
+  </footer>
+
+  <script src="./assets/app.js"></script>
+</body>
+</html>
